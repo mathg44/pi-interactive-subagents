@@ -1304,9 +1304,17 @@ describe("subagent discovery", () => {
         { artifactDir: d, name: "worker" },
       );
       const joined = parts.join(" ");
-      // Model with thinking suffix.
+      // Pin both the active model and the child's Ctrl+P scope. Without
+      // --models, global enabledModels entries for disabled provider extensions
+      // leak into restricted children and produce misleading startup warnings.
       assert.ok(joined.includes("--model"), "expected --model");
       assert.ok(joined.includes("openrouter/z-ai/glm-5.2:medium"), "expected model:thinking");
+      const modelsIdx = parts.indexOf("--models");
+      assert.ok(modelsIdx >= 0, "expected --models");
+      assert.ok(
+        parts[modelsIdx + 1].includes("openrouter/z-ai/glm-5.2:medium"),
+        "expected the assigned model to be the model scope",
+      );
       // Identity written to a file and appended.
       assert.ok(joined.includes("--append-system-prompt"), "expected --append-system-prompt");
       // Default-deny restriction.

@@ -233,6 +233,28 @@ function getToolExtensionPath(tool: string): string | undefined {
 }
 
 /**
+ * Provider extensions must survive the child process's default-deny
+ * `--no-extensions` sandbox too. Keep this separate from tool extensions: the
+ * provider is loaded so Pi can resolve the model, while `--tools` still limits
+ * which tools the child may call.
+ */
+function getModelProviderExtensionPath(model: string): string | undefined {
+  const provider = model.split("/", 1)[0];
+  const map: Record<string, string> = {
+    "claude-bridge": join(
+      getAgentConfigDir(),
+      "npm",
+      "node_modules",
+      "pi-claude-bridge",
+      "src",
+      "index.ts",
+    ),
+  };
+  const extensionPath = map[provider];
+  return extensionPath && existsSync(extensionPath) ? extensionPath : undefined;
+}
+
+/**
  * When this process was spawned as a restricted subagent, the parent pins the
  * set of agents it may itself spawn via PI_SUBAGENT_ALLOWED. `null` means no
  * restriction (top-level session, or an unrestricted child).
@@ -840,6 +862,10 @@ function applySandboxToParts(
   if (loadout.model) {
     const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
     parts.push("--model", shellEscape(model));
+    // Keep the child's cycling scope aligned with its fixed profile. Otherwise
+    // global enabledModels entries can reference provider extensions excluded
+    // by the child's default-deny sandbox and produce misleading warnings.
+    parts.push("--models", shellEscape(model));
   }
 
   if (loadout.identity) {
@@ -865,6 +891,10 @@ function applySandboxToParts(
     parts.push("--tools", shellEscape(loadout.toolAllowlist));
 
     const extPaths = new Set<string>();
+    if (loadout.model) {
+      const providerExtensionPath = getModelProviderExtensionPath(loadout.model);
+      if (providerExtensionPath) extPaths.add(providerExtensionPath);
+    }
     for (const tool of loadout.toolAllowlist.split(",")) {
       const extPath = getToolExtensionPath(tool);
       if (extPath && existsSync(extPath)) extPaths.add(extPath);
