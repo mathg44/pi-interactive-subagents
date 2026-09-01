@@ -22,6 +22,7 @@ import {
   sendLongCommand,
   pollForExit,
   closeSurface,
+  disposeHeadlessSurface,
   shellEscape,
   readScreen,
 } from "./tmux.ts";
@@ -1703,6 +1704,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       agent.abortController?.abort();
     }
     runningSubagents.clear();
+    // Tear down the detached tmux session used for headless (ACP/RPC) spawns, if
+    // one was created. No-op when running inside a tmux pane.
+    disposeHeadlessSurface();
   });
 
   // The spawning tools are always registered here. Whether a child process can

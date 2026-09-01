@@ -40,15 +40,44 @@ function hasCommand(command: string): boolean {
 }
 
 /**
- * True when running inside tmux with the tmux binary on PATH.
- * `TMUX` is set by tmux in every process it spawns (shell or pane).
+ * True when the tmux binary is on PATH. Intentionally weaker than "running
+ * inside tmux": subagent panes are addressed by explicit pane ids and can live
+ * in a detached session, so the primitives only need the binary. Where panes go
+ * (a split off the parent pi pane vs a detached session) is decided by
+ * getParentSurface(); whether subagents are offered at all is isMuxAvailable().
  */
 export function isTmuxAvailable(): boolean {
-  return !!process.env.TMUX && hasCommand("tmux");
+  return hasCommand("tmux");
 }
 
+/**
+ * True when pi is attached to its own tmux pane. `TMUX_PANE` is set by tmux in
+ * every pane; its presence means new subagent panes can appear next to pi.
+ */
+function isInsideTmuxPane(): boolean {
+  return !!process.env.TMUX_PANE;
+}
+
+/**
+ * True when pi is not driving an interactive terminal — the ACP/RPC case, where
+ * pi talks to the editor over pipes so stdout is not a TTY. This is the only
+ * situation in which subagents run in a detached (invisible) tmux session.
+ */
+function isHeadlessSurfaceContext(): boolean {
+  return !process.stdout.isTTY;
+}
+
+/**
+ * Whether subagents can run at all.
+ *  - Inside a tmux pane: yes; panes split off the parent pi pane (visible).
+ *  - No pane but non-interactive (ACP/RPC): yes; panes live in a detached
+ *    session (invisible; attach with `tmux attach -t pi-subagents-<pid>`).
+ *  - Interactive terminal without tmux: no. A human running bare `pi` would not
+ *    see detached panes, so we refuse with muxSetupHint(), unchanged from before.
+ */
 export function isMuxAvailable(): boolean {
-  return isTmuxAvailable();
+  if (!isTmuxAvailable()) return false;
+  return isInsideTmuxPane() || isHeadlessSurfaceContext();
 }
 
 export function muxSetupHint(): string {
@@ -59,6 +88,81 @@ function requireTmux(): void {
   if (!isTmuxAvailable()) {
     throw new Error(`tmux is required for subagents. ${muxSetupHint()}`);
   }
+}
+
+// ── Parent surface ──
+
+/**
+ * A detached tmux session hosts subagent panes when pi has no pane of its own
+ * (the ACP/RPC case). Its first pane is kept as a stable split anchor, mirroring
+ * how attached mode splits off the parent pi pane (`$TMUX_PANE`). The session
+ * name is per-process so parallel pi servers never share panes. Torn down by
+ * disposeHeadlessSurface() on session shutdown.
+ */
+let headlessSessionName: string | null = null;
+let headlessAnchorPane: string | null = null;
+
+function headlessSessionNameForPid(): string {
+  return `pi-subagents-${process.pid}`;
+}
+
+function tmuxSessionExists(name: string): boolean {
+  try {
+    execFileSync("tmux", ["has-session", "-t", name], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Ensure the detached subagent session exists and return its anchor pane id.
+ * Created lazily on the first headless spawn. `-A` keeps this idempotent if a
+ * same-named session already exists (e.g. after pid reuse). `-x`/`-y` give the
+ * detached window a workable size since no client dictates one.
+ */
+function ensureHeadlessAnchor(): string {
+  if (headlessAnchorPane && headlessSessionName && tmuxSessionExists(headlessSessionName)) {
+    return headlessAnchorPane;
+  }
+  const name = headlessSessionNameForPid();
+  const pane = execFileSync(
+    "tmux",
+    ["new-session", "-A", "-d", "-s", name, "-x", "220", "-y", "50", "-P", "-F", "#{pane_id}"],
+    { encoding: "utf8" },
+  ).trim();
+  if (!pane.startsWith("%")) {
+    throw new Error(`Unexpected tmux new-session output: ${pane}`);
+  }
+  headlessSessionName = name;
+  headlessAnchorPane = pane;
+  return pane;
+}
+
+/**
+ * The pane new subagent panes split off from: the parent pi pane when attached,
+ * otherwise the detached session anchor. Returns undefined only when tmux is
+ * unusable, which callers guard against via isMuxAvailable().
+ */
+export function getParentSurface(): string | undefined {
+  if (isInsideTmuxPane()) return process.env.TMUX_PANE;
+  if (isHeadlessSurfaceContext()) return ensureHeadlessAnchor();
+  return undefined;
+}
+
+/**
+ * Kill the detached subagent session, if one was created. Best-effort: called on
+ * session shutdown so detached panes don't linger after pi exits.
+ */
+export function disposeHeadlessSurface(): void {
+  if (!headlessSessionName) return;
+  try {
+    execFileSync("tmux", ["kill-session", "-t", headlessSessionName], { stdio: "ignore" });
+  } catch {
+    // Session may already be gone.
+  }
+  headlessSessionName = null;
+  headlessAnchorPane = null;
 }
 
 // ── Shell helpers ──
@@ -87,8 +191,10 @@ let rebalanceTimer: ReturnType<typeof setTimeout> | null = null;
  * and non-fatal: a cosmetic resize must never break spawning or watching.
  */
 function rebalanceSurfaces(hintPane?: string): void {
-  // Prefer the parent pi pane (stable; survives a closing subagent pane).
-  const target = process.env.TMUX_PANE ?? hintPane;
+  // Prefer the parent pi pane (stable; survives a closing subagent pane). In
+  // headless mode use the already-created detached anchor — never create one
+  // here, since balancing is a cosmetic side path that must have no side effects.
+  const target = process.env.TMUX_PANE ?? headlessAnchorPane ?? hintPane;
   if (!target) return;
   if (rebalanceTimer) clearTimeout(rebalanceTimer);
   rebalanceTimer = setTimeout(() => {
@@ -107,15 +213,16 @@ function rebalanceSurfaces(hintPane?: string): void {
 // ── Surface primitives ──
 
 /**
- * Create a new pane for a subagent: a right split off the parent pi's pane,
- * so new panes follow the agent rather than the user's focus.
+ * Create a new pane for a subagent: a right split off the parent surface, so new
+ * panes follow the agent rather than the user's focus. The parent is the pi pane
+ * when attached, or a detached session anchor under ACP/RPC (getParentSurface).
  * See https://github.com/HazAT/pi-interactive-subagents/issues/12
  *
  * Returns the new pane id (e.g. `%12`).
  */
 export function createSurface(name: string): string {
   void name; // tmux panes are not named; the pi process inside shows its own title.
-  return createSurfaceSplit(name, "right", process.env.TMUX_PANE);
+  return createSurfaceSplit(name, "right", getParentSurface());
 }
 
 /**
